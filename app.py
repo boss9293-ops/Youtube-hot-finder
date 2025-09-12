@@ -74,6 +74,15 @@ def delete_api_key_on_disk() -> bool:
         return True
     except Exception:
         return False
+def rotate_api_key():
+    keys = st.session_state.get("api_keys", [])
+    if not keys:
+        return False
+    i = st.session_state.get("api_key_idx", 0)
+    i = (i + 1) % len(keys)
+    st.session_state["api_key_idx"] = i
+    st.session_state["api_key"] = keys[i]
+    return True
 
 # -----------------------
 # Session defaults
@@ -142,7 +151,9 @@ def translate_keywords_list(keywords: List[str], src_lang: str, tgt_lang: str) -
 # -----------------------
 def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
            wait_minutes: float = 0.0, max_retries: int = 2) -> Dict[str, Any]:
-    params = {**params, "key": api_key}
+   # 회전된 키가 있으면 그걸 우선 사용
+    params = {**params, "key": st.session_state.get("api_key", api_key)}
+
     tries = 0
     while True:
         r = requests.get(f"{API_BASE}/{endpoint}", params=params, timeout=30)
@@ -162,21 +173,50 @@ def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
             or r.text
         )
 
+    # 기존 if r.status_code in (403, 429) and any(... "quota" ...) and wait_minutes > 0 ... 블록을 전부 교체
+        qwords = ("quota", "daily", "rate", "exceed")  # "quotaExceeded" 등에 대응
         if (
             r.status_code in (403, 429)
-            and any(k in str(err_reason).lower() for k in ["quota", "daily", "rate", "exceed"])
-            and wait_minutes > 0
-            and tries <= max_retries
+            and any(k in str(err_reason).lower() for k in qwords)
         ):
-            st.session_state["api_waiting"] = True
-            st.session_state["api_wait_reason"] = f"{endpoint}: {err_reason}"
-            wait_secs = int(wait_minutes * 60)
-            with st.status("API 쿼터 초과로 대기 중…", expanded=True) as stat:
-                for s in range(wait_secs, 0, -1):
-                    stat.update(label=f"API 대기 {s}초 남음 (사유: {err_reason})")
-                    time.sleep(1)
-            st.session_state["api_waiting"] = False
-            continue
+            # 1) 키 로테이션 후 즉시 1회 재시도
+            rotated = rotate_api_key()
+            if rotated:
+                # 새 키로 다시 요청
+                params_retry = {**params, "key": st.session_state.get("api_key")}
+                try:
+                    r2 = requests.get(f"{API_BASE}/{endpoint}", params=params_retry, timeout=30)
+                except Exception:
+                    r2 = None
+
+                if r2 is not None and r2.status_code == 200:
+                    _record_quota(endpoint, r2.url)
+                    return r2.json()
+
+                # 재시도도 실패 시, err_reason 업데이트(가능하면)
+                try:
+                    body2 = r2.json() if r2 is not None else {}
+                    err_reason = (
+                        (body2.get("error", {}).get("errors", [{}])[0].get("reason"))
+                        or body2.get("error", {}).get("message", "")
+                        or err_reason
+                    )
+                except Exception:
+                    pass
+
+            # 2) (선택) 대기 후 재시도: 기존 로직 유지
+            if wait_minutes > 0 and tries <= max_retries:
+                st.session_state["api_waiting"] = True
+                st.session_state["api_wait_reason"] = f"{endpoint}: {err_reason}"
+                wait_secs = int(wait_minutes * 60)
+                with st.status("API 쿼터 초과로 대기 중…", expanded=True) as stat:
+                    for s in range(wait_secs, 0, -1):
+                        stat.update(label=f"API 대기 {s}초 남음 (사유: {err_reason})")
+                        time.sleep(1)
+                st.session_state["api_waiting"] = False
+                continue
+
+          
 
         raise RuntimeError(f"YouTube API error {r.status_code}: {r.text}")
 
@@ -551,85 +591,98 @@ with tab_settings:
     st.subheader("설정")
     with st.container():
         # API 키
-        st.text_input("YouTube Data API v3 키", type="password", key="api_key")
-        api_key = st.session_state.get("api_key", "")
+        # 위에 넣으신 session_state 초기화 코드(= api_keys, api_key_idx, api_key 세팅)는 그대로 두세요.
 
-        b1, b2, b3 = st.columns([0.25, 0.25, 0.5])
-        if b1.button("API 키 저장"):
-            if api_key:
-                ok = save_api_key_to_disk(api_key)
-                st.success("API 키를 로컬에 저장했습니다." if ok else "저장 실패.")
-            else:
-                st.warning("API 키가 비어 있습니다.")
-        if b2.button("API 키 삭제"):
-            ok = delete_api_key_on_disk()
-            if ok:
-                st.session_state["api_key"] = ""; st.success("로컬 저장된 API 키를 삭제했습니다.")
-            else:
-                st.warning("삭제 실패 또는 저장된 키 없음.")
-        b3.caption(f"로컬 경로: `{CONFIG_PATH}` (개인PC 외 저장 비권장)")
+# ---- API 키 입력 UI (선택) ----
+        user_key = st.text_input(
+        "YouTube Data API v3 키 (선택 입력: Secrets에 여러 키가 있으면 생략해도 됩니다)",
+        value=str(st.session_state.get("api_key", "")),   # 항상 문자열
+        type="password",
+        key="api_key_input",
+)
 
-        # 검색/필터 옵션
-        run_mode = st.selectbox("실행모드", ["채널", "키워드", "둘다"], index=2, key="run_mode")
-        form_factor = st.selectbox("쇼츠/롱폼", ["쇼츠", "롱폼", "둘다"], key="form_factor")
-        shorts_sec = st.number_input("쇼츠 기준(초)", min_value=10, max_value=300, value=60, step=5, key="shorts_sec")
-        days_back = st.number_input("최근 몇일간의 영상을 분석할까요", min_value=1, max_value=3650, value=180, key="days_back")
-        per_channel_max = st.number_input("채널당 최대 검색 수", min_value=10, max_value=1000, value=200, step=10, key="per_channel_max")
-        per_keyword_max = st.number_input("검색어당 최대 검색수", min_value=10, max_value=1000, value=200, step=10, key="per_keyword_max")
-        min_vph = st.number_input("최소 시간당 조회수", min_value=0.0, value=0.0, step=10.0, key="min_vph")
-        wait_minutes = st.number_input("API키 쿼터 소진 시 대기시간(분)", min_value=0.0, value=0.0, step=0.5, key="wait_minutes")
-        ignore_filters = st.checkbox("테스트용: 길이/시간당 조회수 필터 무시", value=False, key="ignore_filters")
+# 사용자가 직접 입력하면 session_state의 현재 키로 반영
+if user_key:
+    st.session_state["api_key"] = user_key
 
-        # 국가 범위만 선택(심플)
-        st.markdown("### 🌐 국가 범위")
-        scope = st.radio("검색 범위", ["한국만", "해외만", "한국+해외"], index=2, horizontal=True, key="region_scope")
-        overseas_regions = []
-        if scope in ("해외만", "한국+해외"):
-            overseas_regions = st.multiselect("해외 국가 선택", options=FOREIGN_PRESET, default=FOREIGN_PRESET, key="overseas_regions")
-        target_regions = (["KR"] if scope in ("한국만","한국+해외") else []) + (overseas_regions if scope in ("해외만","한국+해외") else [])
-        st.session_state["target_regions"] = target_regions
+    api_key = st.session_state.get("api_key", "")
 
-        # 키워드 엄격 필터 옵션
-        st.markdown("**키워드 정확도 옵션**")
-        strict_on = st.checkbox("키워드 엄격 필터링 (제목/설명/태그 검사)", value=True, key="kw_strict_on")
-        strict_mode = st.radio("매칭 방식", options=["하나 이상 포함(권장)", "모두 포함(엄격)"], index=0, horizontal=True, key="kw_strict_mode")
+    b1, b2, b3 = st.columns([0.25, 0.25, 0.5])
+    if b1.button("API 키 저장"):
+        if api_key:
+            ok = save_api_key_to_disk(api_key)
+            st.success("API 키를 로컬에 저장했습니다." if ok else "저장 실패.")
+        else:
+            st.warning("API 키가 비어 있습니다.")
+    if b2.button("API 키 삭제"):
+        ok = delete_api_key_on_disk()
+        if ok:
+            st.session_state["api_key"] = ""; st.success("로컬 저장된 API 키를 삭제했습니다.")
+        else:
+            st.warning("삭제 실패 또는 저장된 키 없음.")
+    b3.caption(f"로컬 경로: `{CONFIG_PATH}` (개인PC 외 저장 비권장)")
 
-        # Quota Estimator (대략)
-        st.subheader("🔢 쿼터 예상 소모량")
-        def parse_for_estimator(txt: Optional[str]) -> List[str]:
-            return [p.strip() for part in (txt or "").split(",") for p in part.split() if p.strip()]
-        ch_list = parse_for_estimator(st.session_state.get("channels_input","")) if st.session_state["run_mode"] in ("채널","둘다") else []
-        kw_list = st.session_state.get("effective_keywords", []) if st.session_state["run_mode"] in ("키워드","둘다") else []
-        est_videos = len(ch_list) * st.session_state["per_channel_max"] + len(kw_list) * st.session_state["per_keyword_max"]
-        search_calls = len(ch_list) * math.ceil(st.session_state["per_channel_max"]/50) + len(kw_list) * math.ceil(st.session_state["per_keyword_max"]/50)
-        search_units = search_calls * 100
-        videos_calls = math.ceil(est_videos/50) if est_videos else 0
-        videos_units = videos_calls * 1
-        chan_calls_min = math.ceil((len(ch_list) or 0)/50) if est_videos else 0
-        chan_calls_max = math.ceil(est_videos/50) if est_videos else 0
-        chan_units_min = chan_calls_min * 1
-        chan_units_max = chan_calls_max * 1
-        total_units_min = search_units + videos_units + chan_units_min
-        total_units_max = search_units + videos_units + chan_units_max
-        quota = DEFAULT_DAILY_QUOTA
-        warn = total_units_max > quota
+    # 검색/필터 옵션
+    run_mode = st.selectbox("실행모드", ["채널", "키워드", "둘다"], index=2, key="run_mode")
+    form_factor = st.selectbox("쇼츠/롱폼", ["쇼츠", "롱폼", "둘다"], key="form_factor")
+    shorts_sec = st.number_input("쇼츠 기준(초)", min_value=10, max_value=300, value=60, step=5, key="shorts_sec")
+    days_back = st.number_input("최근 몇일간의 영상을 분석할까요", min_value=1, max_value=3650, value=180, key="days_back")
+    per_channel_max = st.number_input("채널당 최대 검색 수", min_value=10, max_value=1000, value=200, step=10, key="per_channel_max")
+    per_keyword_max = st.number_input("검색어당 최대 검색수", min_value=10, max_value=1000, value=200, step=10, key="per_keyword_max")
+    min_vph = st.number_input("최소 시간당 조회수", min_value=0.0, value=0.0, step=10.0, key="min_vph")
+    wait_minutes = st.number_input("API키 쿼터 소진 시 대기시간(분)", min_value=0.0, value=0.0, step=0.5, key="wait_minutes")
+    ignore_filters = st.checkbox("테스트용: 길이/시간당 조회수 필터 무시", value=False, key="ignore_filters")
 
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("search.list(100/u)", f"{search_units:,}", f"{search_calls} calls")
-        cB.metric("videos.list(1/u)", f"{videos_units:,}", f"{videos_calls} calls")
-        cC.metric("channels.list(1/u)", f"{chan_units_min:,} ~ {chan_units_max:,}", f"{chan_calls_min}~{chan_calls_max} calls")
-        cD.metric("총 예상(최소~최대)", f"{total_units_min:,} ~ {total_units_max:,}", f"일일 한도 {quota:,}")
+    # 국가 범위만 선택(심플)
+    st.markdown("### 🌐 국가 범위")
+    scope = st.radio("검색 범위", ["한국만", "해외만", "한국+해외"], index=2, horizontal=True, key="region_scope")
+    overseas_regions = []
+    if scope in ("해외만", "한국+해외"):
+        overseas_regions = st.multiselect("해외 국가 선택", options=FOREIGN_PRESET, default=FOREIGN_PRESET, key="overseas_regions")
+    target_regions = (["KR"] if scope in ("한국만","한국+해외") else []) + (overseas_regions if scope in ("해외만","한국+해외") else [])
+    st.session_state["target_regions"] = target_regions
 
-        if not warn: st.success("대부분 한도 내에서 동작합니다.")
-        else: st.error("최대 추정 사용량이 일일 한도를 초과할 수 있습니다. 검색 개수/키워드/채널 수를 조정하세요.")
+    # 키워드 엄격 필터 옵션
+    st.markdown("**키워드 정확도 옵션**")
+    strict_on = st.checkbox("키워드 엄격 필터링 (제목/설명/태그 검사)", value=True, key="kw_strict_on")
+    strict_mode = st.radio("매칭 방식", options=["하나 이상 포함(권장)", "모두 포함(엄격)"], index=0, horizontal=True, key="kw_strict_mode")
 
-        col_run, col_clear = st.columns([0.25, 0.25])
-        run = col_run.button("시작하기", type="primary", key="run_btn")
-        clear = col_clear.button("결과 지우기", key="clear_btn")
-        if clear:
-            st.session_state["results_df"] = pd.DataFrame()
-            st.session_state["payload_cache"] = []
-            st.experimental_rerun()
+    # Quota Estimator (대략)
+    st.subheader("🔢 쿼터 예상 소모량")
+    def parse_for_estimator(txt: Optional[str]) -> List[str]:
+        return [p.strip() for part in (txt or "").split(",") for p in part.split() if p.strip()]
+    ch_list = parse_for_estimator(st.session_state.get("channels_input","")) if st.session_state["run_mode"] in ("채널","둘다") else []
+    kw_list = st.session_state.get("effective_keywords", []) if st.session_state["run_mode"] in ("키워드","둘다") else []
+    est_videos = len(ch_list) * st.session_state["per_channel_max"] + len(kw_list) * st.session_state["per_keyword_max"]
+    search_calls = len(ch_list) * math.ceil(st.session_state["per_channel_max"]/50) + len(kw_list) * math.ceil(st.session_state["per_keyword_max"]/50)
+    search_units = search_calls * 100
+    videos_calls = math.ceil(est_videos/50) if est_videos else 0
+    videos_units = videos_calls * 1
+    chan_calls_min = math.ceil((len(ch_list) or 0)/50) if est_videos else 0
+    chan_calls_max = math.ceil(est_videos/50) if est_videos else 0
+    chan_units_min = chan_calls_min * 1
+    chan_units_max = chan_calls_max * 1
+    total_units_min = search_units + videos_units + chan_units_min
+    total_units_max = search_units + videos_units + chan_units_max
+    quota = DEFAULT_DAILY_QUOTA
+    warn = total_units_max > quota
+
+    cA, cB, cC, cD = st.columns(4)
+    cA.metric("search.list(100/u)", f"{search_units:,}", f"{search_calls} calls")
+    cB.metric("videos.list(1/u)", f"{videos_units:,}", f"{videos_calls} calls")
+    cC.metric("channels.list(1/u)", f"{chan_units_min:,} ~ {chan_units_max:,}", f"{chan_calls_min}~{chan_calls_max} calls")
+    cD.metric("총 예상(최소~최대)", f"{total_units_min:,} ~ {total_units_max:,}", f"일일 한도 {quota:,}")
+
+    if not warn: st.success("대부분 한도 내에서 동작합니다.")
+    else: st.error("최대 추정 사용량이 일일 한도를 초과할 수 있습니다. 검색 개수/키워드/채널 수를 조정하세요.")
+
+    col_run, col_clear = st.columns([0.25, 0.25])
+    run = col_run.button("시작하기", type="primary", key="run_btn")
+    clear = col_clear.button("결과 지우기", key="clear_btn")
+    if clear:
+        st.session_state["results_df"] = pd.DataFrame()
+        st.session_state["payload_cache"] = []
+        st.experimental_rerun()
 
 # -----------------------
 # Main run
@@ -872,4 +925,5 @@ with tab_results:
 
 st.markdown("---")
 st.caption("입력 탭에서 바로 다국어 키워드를 미리보고, 설정 탭에서는 국가 범위만 고르면 됩니다. 제목·설명·태그 기반 엄격 필터도 유지됩니다.")
+
 
