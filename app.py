@@ -17,23 +17,14 @@ from typing import Optional, List, Dict, Any, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
-# === Secrets → session_state (최우선) ===
-if "api_keys" not in st.session_state:
-    # 배열형(권장)
-    keys = list(st.secrets.get("YOUTUBE_API_KEYS", []))
-    # 단일 키 호환
-    if not keys and "YOUTUBE_API_KEY" in st.secrets:
-        keys = [st.secrets["YOUTUBE_API_KEY"]]
+# -----------------------------------------------------------------------------
+# Page config
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="YouTube Hot Finder", layout="wide")
 
-    st.session_state["api_keys"] = keys
-    st.session_state["api_key_idx"] = 0
-    if keys:
-        st.session_state["api_key"] = keys[0]  # 기존 코드와의 호환
-
-
-# -----------------------
+# -----------------------------------------------------------------------------
 # Constants / Config
-# -----------------------
+# -----------------------------------------------------------------------------
 API_BASE = "https://www.googleapis.com/youtube/v3"
 DEFAULT_DAILY_QUOTA = 10_000
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".youtube_hot_finder.json")
@@ -42,19 +33,17 @@ LANG_NAME = {
     "ko": "Korean", "en": "English", "ja": "Japanese", "zh": "Chinese",
     "es": "Spanish", "de": "German", "fr": "French", "pt": "Portuguese"
 }
+FOREIGN_PRESET = ["US", "JP", "TW", "HK", "SG", "GB", "DE", "FR", "ES", "BR"]  # 해외 프리셋
 
-# 해외 기본 프리셋(필요 시 수정)
-FOREIGN_PRESET = ["US","JP","TW","HK","SG","GB","DE","FR","ES","BR"]
-
-# -----------------------
-# API Key persistence
-# -----------------------
+# -----------------------------------------------------------------------------
+# API key: 저장/불러오기 및 안전 로딩
+# -----------------------------------------------------------------------------
 def load_api_key_from_disk() -> Optional[str]:
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("api_key")
+            return str(data.get("api_key") or "").strip()
     except Exception:
         pass
     return None
@@ -74,19 +63,65 @@ def delete_api_key_on_disk() -> bool:
         return True
     except Exception:
         return False
-def rotate_api_key():
+
+def _load_api_keys_safely() -> List[str]:
+    """환경변수 → secrets → 로컬 저장 순으로 다중/단일 키를 수집하고 중복 제거."""
+    keys: List[str] = []
+
+    # 1) 환경변수 (다중/단일)
+    env_multi = os.getenv("YOUTUBE_API_KEYS", "")
+    if env_multi.strip():
+        keys += [k.strip() for k in env_multi.split(",") if k.strip()]
+    env_single = os.getenv("YOUTUBE_API_KEY", "")
+    if env_single.strip():
+        keys.append(env_single.strip())
+
+    # 2) secrets.toml (없어도 예외 안터지게 보호)
+    try:
+        sec = st.secrets
+        if "YOUTUBE_API_KEYS" in sec:
+            v = sec["YOUTUBE_API_KEYS"]
+            if isinstance(v, (list, tuple)):
+                keys += [str(x).strip() for x in v if str(x).strip()]
+            else:
+                keys += [x.strip() for x in str(v).split(",") if x.strip()]
+        if "YOUTUBE_API_KEY" in sec:
+            keys.append(str(sec["YOUTUBE_API_KEY"]).strip())
+    except Exception:
+        pass
+
+    # 3) 로컬 저장
+    if not keys:
+        dk = load_api_key_from_disk()
+        if dk:
+            keys = [dk]
+
+    # 중복 제거(순서 유지)
+    seen, uniq = set(), []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k); uniq.append(k)
+    return uniq
+
+def rotate_api_key() -> bool:
     keys = st.session_state.get("api_keys", [])
     if not keys:
         return False
-    i = st.session_state.get("api_key_idx", 0)
-    i = (i + 1) % len(keys)
+    i = (st.session_state.get("api_key_idx", 0) + 1) % len(keys)
     st.session_state["api_key_idx"] = i
     st.session_state["api_key"] = keys[i]
     return True
 
-# -----------------------
+# 최초 세션 세팅
+if "api_keys" not in st.session_state:
+    _keys = _load_api_keys_safely()
+    st.session_state["api_keys"] = _keys
+    st.session_state["api_key_idx"] = 0
+    st.session_state["api_key"] = (_keys[0] if _keys else (load_api_key_from_disk() or ""))
+
+# -----------------------------------------------------------------------------
 # Session defaults
-# -----------------------
+# -----------------------------------------------------------------------------
 st.session_state.setdefault("q_calls", {"search": 0, "videos": 0, "channels": 0})
 st.session_state.setdefault("q_units", 0)
 st.session_state.setdefault("q_log", [])
@@ -116,9 +151,9 @@ def _record_quota(endpoint_name: str, path: str) -> None:
     st.session_state["q_units"] += units
     st.session_state["q_log"].append((endpoint_name, units, path, time.time()))
 
-# -----------------------
+# -----------------------------------------------------------------------------
 # Translator (cached with fallback)
-# -----------------------
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def translate_keyword_once(src_text: str, src_lang: str, tgt_lang: str) -> str:
     s = (src_text or "").strip()
@@ -146,12 +181,12 @@ def translate_keywords_list(keywords: List[str], src_lang: str, tgt_lang: str) -
             seen.add(v.lower()); outs.append(v)
     return outs
 
-# -----------------------
-# YouTube API helpers
-# -----------------------
+# -----------------------------------------------------------------------------
+# YouTube API helpers (쿼터 초과 시 자동 로테이션)
+# -----------------------------------------------------------------------------
 def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
            wait_minutes: float = 0.0, max_retries: int = 2) -> Dict[str, Any]:
-   # 회전된 키가 있으면 그걸 우선 사용
+    # 항상 현재 회전키 우선
     params = {**params, "key": st.session_state.get("api_key", api_key)}
 
     tries = 0
@@ -162,28 +197,26 @@ def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
             return r.json()
 
         tries += 1
-        body = {}
+
+        # 에러 이유 추출(가능하면)
         try:
             body = r.json()
+            err_reason = (
+                (body.get("error", {}).get("errors", [{}])[0].get("reason"))
+                or body.get("error", {}).get("message", "")
+                or r.text
+            )
         except Exception:
-            pass
-        err_reason = (
-            (body.get("error", {}).get("errors", [{}])[0].get("reason"))
-            or body.get("error", {}).get("message", "")
-            or r.text
-        )
+            err_reason = r.text
 
-    # 기존 if r.status_code in (403, 429) and any(... "quota" ...) and wait_minutes > 0 ... 블록을 전부 교체
-        qwords = ("quota", "daily", "rate", "exceed")  # "quotaExceeded" 등에 대응
-        if (
-            r.status_code in (403, 429)
-            and any(k in str(err_reason).lower() for k in qwords)
-        ):
-            # 1) 키 로테이션 후 즉시 1회 재시도
-            rotated = rotate_api_key()
-            if rotated:
-                # 새 키로 다시 요청
+        qwords = ("quota", "daily", "rate", "exceed")  # quotaExceeded 등 포괄
+        is_quota = (r.status_code in (403, 429) and any(k in str(err_reason).lower() for k in qwords))
+
+        if is_quota:
+            # 1) API 키 로테이션 1회 즉시 재시도
+            if rotate_api_key():
                 params_retry = {**params, "key": st.session_state.get("api_key")}
+                r2 = None
                 try:
                     r2 = requests.get(f"{API_BASE}/{endpoint}", params=params_retry, timeout=30)
                 except Exception:
@@ -193,7 +226,7 @@ def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
                     _record_quota(endpoint, r2.url)
                     return r2.json()
 
-                # 재시도도 실패 시, err_reason 업데이트(가능하면)
+                # 실패한 경우 err_reason 업데이트(가능하면)
                 try:
                     body2 = r2.json() if r2 is not None else {}
                     err_reason = (
@@ -204,7 +237,7 @@ def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
                 except Exception:
                     pass
 
-            # 2) (선택) 대기 후 재시도: 기존 로직 유지
+            # 2) (옵션) 대기 후 재시도
             if wait_minutes > 0 and tries <= max_retries:
                 st.session_state["api_waiting"] = True
                 st.session_state["api_wait_reason"] = f"{endpoint}: {err_reason}"
@@ -214,26 +247,28 @@ def yt_get(endpoint: str, params: Dict[str, Any], api_key: str,
                         stat.update(label=f"API 대기 {s}초 남음 (사유: {err_reason})")
                         time.sleep(1)
                 st.session_state["api_waiting"] = False
-                continue
+                continue  # while 루프 재시도
 
-          
-
+        # 다른 에러거나 재시도 불가면 즉시 예외
         raise RuntimeError(f"YouTube API error {r.status_code}: {r.text}")
 
 def iso8601_to_seconds(duration: str) -> int:
     import re
     m = re.fullmatch(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration)
-    if not m: return 0
+    if not m:
+        return 0
     h = int(m.group(1) or 0); m_ = int(m.group(2) or 0); s = int(m.group(3) or 0)
-    return h*3600 + m_*60 + s
+    return h * 3600 + m_ * 60 + s
 
 def batched(iterable: List[Any], n: int):
     batch = []
     for x in iterable:
         batch.append(x)
         if len(batch) == n:
-            yield batch; batch = []
-    if batch: yield batch
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 def fetch_videos_by_search(
     api_key: str, query: Optional[str] = None, channel_id: Optional[str] = None,
@@ -243,7 +278,7 @@ def fetch_videos_by_search(
 ) -> List[str]:
     effective_order = "date" if (published_after and order != "date") else order
     ids: List[str] = []
-    params = {"part":"snippet","type":"video","maxResults":50,"order":effective_order}
+    params = {"part": "snippet", "type": "video", "maxResults": 50, "order": effective_order}
     if query: params["q"] = query
     if channel_id: params["channelId"] = channel_id
     if region_code: params["regionCode"] = region_code
@@ -252,30 +287,35 @@ def fetch_videos_by_search(
 
     next_page = None
     while True:
-        if next_page: params["pageToken"] = next_page
+        if next_page:
+            params["pageToken"] = next_page
         data = yt_get("search", params, api_key, wait_minutes=wait_minutes)
         for item in data.get("items", []):
             vid = item["id"]["videoId"]
             ids.append(vid)
-            if len(ids) >= max_results: return ids
+            if len(ids) >= max_results:
+                return ids
         next_page = data.get("nextPageToken")
-        if not next_page: break
+        if not next_page:
+            break
     return ids
 
 def fetch_video_details(api_key: str, video_ids: List[str], wait_minutes: float = 0.0) -> Dict[str, Any]:
     details: Dict[str, Any] = {}
-    if not video_ids: return details
+    if not video_ids:
+        return details
     for batch in batched(video_ids, 50):
-        data = yt_get("videos", {"part":"snippet,contentDetails,statistics","id":",".join(batch)}, api_key, wait_minutes=wait_minutes)
+        data = yt_get("videos", {"part": "snippet,contentDetails,statistics", "id": ",".join(batch)}, api_key, wait_minutes=wait_minutes)
         for item in data.get("items", []):
             details[item["id"]] = item
     return details
 
 def fetch_channel_subs(api_key: str, channel_ids: List[str], wait_minutes: float = 0.0) -> Dict[str, int]:
     subs: Dict[str, int] = {}
-    if not channel_ids: return subs
+    if not channel_ids:
+        return subs
     for batch in batched(channel_ids, 50):
-        data = yt_get("channels", {"part":"statistics","id":",".join(batch)}, api_key, wait_minutes=wait_minutes)
+        data = yt_get("channels", {"part": "statistics", "id": ",".join(batch)}, api_key, wait_minutes=wait_minutes)
         for item in data.get("items", []):
             subs[item["id"]] = int(item["statistics"].get("subscriberCount", 0))
     return subs
@@ -291,7 +331,8 @@ def compute_metrics(detail: Dict[str, Any]) -> Dict[str, Any]:
 
 def human_duration(seconds: int) -> str:
     h = seconds // 3600; m = (seconds % 3600) // 60; s = seconds % 60
-    if h: return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+    if h:
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
     return f"{int(m):02d}:{int(s):02d}"
 
 def filter_duration_mode(dur_sec: int, mode: str, shorts_sec: int = 60) -> bool:
@@ -301,12 +342,13 @@ def filter_duration_mode(dur_sec: int, mode: str, shorts_sec: int = 60) -> bool:
     return True
 
 def parse_list_field(txt: Optional[str]) -> List[str]:
-    if not txt: return []
+    if not txt:
+        return []
     return [p.strip() for part in txt.split(",") for p in part.split() if p.strip()]
 
-# -----------------------
-# Keyword strict filter
-# -----------------------
+# -----------------------------------------------------------------------------
+# 키워드 엄격 필터
+# -----------------------------------------------------------------------------
 def normalize_text(s: str) -> str:
     return (s or "").lower()
 
@@ -320,9 +362,9 @@ def contains_keywords(text: str, keywords: List[str], mode: str) -> bool:
     else:
         return any(k in t for k in ks)
 
-# -----------------------
+# -----------------------------------------------------------------------------
 # HTML/JS component (table + preview)
-# -----------------------
+# -----------------------------------------------------------------------------
 def build_component_html(payload: List[Dict[str, Any]]) -> str:
     tpl = r"""
 <div id="app-root"></div>
@@ -460,9 +502,9 @@ td:not(.title),th:not(.title){white-space:nowrap;}
     data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     return tpl.replace("__DATA__", data_json)
 
-# -----------------------
+# -----------------------------------------------------------------------------
 # Transcript helpers
-# -----------------------
+# -----------------------------------------------------------------------------
 def _format_srt_time(seconds: float) -> str:
     ms = int(round((seconds - int(seconds)) * 1000))
     total = int(seconds)
@@ -491,7 +533,8 @@ def fetch_transcript_srt(video_id: str, lang_pref: str = "ko") -> Optional[str]:
         for lp in langs:
             try:
                 tr = list_obj.find_transcript([lp])
-                segs = tr.fetch(); break
+                segs = tr.fetch()
+                break
             except Exception:
                 pass
         if segs is None:
@@ -531,10 +574,9 @@ def build_transcripts_zip_cached(vids: Tuple[str, ...], labels: Tuple[str, ...],
             zf.writestr("README.txt", "No transcript for:\n\n" + "\n".join(f"- {m}" for m in missing))
     return buf.getvalue()
 
-# -----------------------
-# Streamlit Page
-# -----------------------
-st.set_page_config(page_title="YouTube Hot Finder", layout="wide")
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
 st.title("🔥 YouTube Hot Finder")
 
 # Live quota header
@@ -552,86 +594,89 @@ def render_quota_header():
         c4.metric("총 유닛", f"{used:,}")
 render_quota_header()
 
-# Tabs
 tab_input, tab_settings, tab_results = st.tabs(["키워드·채널 입력", "설정", "결과"])
 
-# -----------------------
-# Input Tab (live translation)
-# -----------------------
+# ----------------------- Input Tab -----------------------
 with tab_input:
     st.subheader("키워드 / 채널핸들 입력")
 
     col_sel1, col_sel2, col_chk = st.columns([0.25, 0.25, 0.5])
     with col_sel1:
-        live_src = st.selectbox("입력 언어", ["ko","en","ja","zh","es","de","fr","pt"], index=0, key="live_src")
+        st.selectbox("입력 언어", ["ko", "en", "ja", "zh", "es", "de", "fr", "pt"], index=0, key="live_src")
     with col_sel2:
-        live_dst = st.selectbox("변환 언어", ["ja","ko","en","zh","es","de","fr","pt"], index=0, key="live_dst")  # 기본 ja
+        st.selectbox("변환 언어", ["ja", "ko", "en", "zh", "es", "de", "fr", "pt"], index=0, key="live_dst")
     with col_chk:
-        live_replace = st.checkbox("번역본을 검색에 사용(원문 대신)", value=True, key="live_replace")
+        st.checkbox("번역본을 검색에 사용(원문 대신)", value=True, key="live_replace")
 
     c1, c2 = st.columns(2)
     with c1:
         st.text_area("키워드(원문: 쉼표/스페이스/줄바꿈 구분)", key="kw_src", height=80, placeholder="예: 시니어, 황혼")
-    # 즉시 변환
-    src_list = parse_list_field(st.session_state.get("kw_src",""))
+
+    src_list = parse_list_field(st.session_state.get("kw_src", ""))
     dst_list = translate_keywords_list(src_list, st.session_state["live_src"], st.session_state["live_dst"])
     with c2:
         st.text_area(f"키워드(변환: {st.session_state['live_dst']})", value=", ".join(dst_list), height=80, disabled=True)
 
-    # 검색에 사용할 최종 키워드/언어
     st.session_state["effective_keywords"] = dst_list if st.session_state["live_replace"] else src_list
     st.session_state["effective_lang"] = st.session_state["live_dst"] if st.session_state["live_replace"] else st.session_state["live_src"]
 
-    channels_input = st.text_area("채널 핸들 또는 채널 ID (쉼표/스페이스/줄바꿈 구분)", key="channels_input", height=80, placeholder="@channel 또는 UCxxxxx")
+    st.text_area("채널 핸들 또는 채널 ID (쉼표/스페이스/줄바꿈 구분)", key="channels_input", height=80, placeholder="@channel 또는 UCxxxxx")
 
-# -----------------------
-# Settings Tab (simple scope)
-# -----------------------
+# ----------------------- Settings Tab -----------------------
 with tab_settings:
     st.subheader("설정")
-    with st.container():
-        # API 키
-        # 위에 넣으신 session_state 초기화 코드(= api_keys, api_key_idx, api_key 세팅)는 그대로 두세요.
 
-# ---- API 키 입력 UI (선택) ----
-        user_key = st.text_input(
-        "YouTube Data API v3 키 (선택 입력: Secrets에 여러 키가 있으면 생략해도 됩니다)",
-        value=str(st.session_state.get("api_key", "")),   # 항상 문자열
+    # --- API 키 입력/관리 ---
+    current_keys = st.session_state.get("api_keys", [])
+    current_display = ",".join(current_keys) if current_keys else st.session_state.get("api_key", "")
+    user_key = st.text_input(
+        "YouTube Data API v3 키 (쉼표로 여러 개 입력 가능)",
+        value=str(current_display),
         type="password",
         key="api_key_input",
-)
+        help="예) key1,key2,key3  → 쿼터 초과 시 자동 로테이션"
+    )
 
-# 사용자가 직접 입력하면 session_state의 현재 키로 반영
-if user_key:
-    st.session_state["api_key"] = user_key
-
-    api_key = st.session_state.get("api_key", "")
-
-    b1, b2, b3 = st.columns([0.25, 0.25, 0.5])
-    if b1.button("API 키 저장"):
-        if api_key:
-            ok = save_api_key_to_disk(api_key)
-            st.success("API 키를 로컬에 저장했습니다." if ok else "저장 실패.")
+    # 입력값 반영 (쉼표 분리 다중키 지원)
+    if user_key is not None:
+        parsed = [k.strip() for k in user_key.split(",") if k.strip()]
+        if parsed:
+            st.session_state["api_keys"] = parsed
+            st.session_state["api_key_idx"] = 0
+            st.session_state["api_key"] = parsed[0]
         else:
-            st.warning("API 키가 비어 있습니다.")
-    if b2.button("API 키 삭제"):
+            st.session_state["api_keys"] = []
+            st.session_state["api_key_idx"] = 0
+            st.session_state["api_key"] = ""
+
+    c1, c2, c3 = st.columns([0.25, 0.25, 0.5])
+    if c1.button("API 키 저장"):
+        if st.session_state.get("api_key", ""):
+            ok = save_api_key_to_disk(st.session_state["api_key"])
+            st.success("로컬에 저장했습니다." if ok else "저장 실패")
+        else:
+            st.warning("저장할 키가 없습니다.")
+    if c2.button("API 키 삭제"):
         ok = delete_api_key_on_disk()
         if ok:
-            st.session_state["api_key"] = ""; st.success("로컬 저장된 API 키를 삭제했습니다.")
+            st.session_state["api_keys"] = []
+            st.session_state["api_key_idx"] = 0
+            st.session_state["api_key"] = ""
+            st.success("로컬 저장 키를 삭제했습니다.")
         else:
-            st.warning("삭제 실패 또는 저장된 키 없음.")
-    b3.caption(f"로컬 경로: `{CONFIG_PATH}` (개인PC 외 저장 비권장)")
+            st.warning("삭제 실패 또는 저장된 키가 없습니다.")
+    c3.caption(f"로컬 저장 위치: `{CONFIG_PATH}` (개인 PC 외 저장은 권장하지 않음)")
 
     # 검색/필터 옵션
-    run_mode = st.selectbox("실행모드", ["채널", "키워드", "둘다"], index=2, key="run_mode")
-    form_factor = st.selectbox("쇼츠/롱폼", ["쇼츠", "롱폼", "둘다"], key="form_factor")
-    shorts_sec = st.number_input("쇼츠 기준(초)", min_value=10, max_value=300, value=60, step=5, key="shorts_sec")
-    days_back = st.number_input("최근 몇일간의 영상을 분석할까요", min_value=1, max_value=3650, value=180, key="days_back")
-    per_channel_max = st.number_input("채널당 최대 검색 수", min_value=10, max_value=1000, value=200, step=10, key="per_channel_max")
-    per_keyword_max = st.number_input("검색어당 최대 검색수", min_value=10, max_value=1000, value=200, step=10, key="per_keyword_max")
-    min_vph = st.number_input("최소 시간당 조회수", min_value=0.0, value=0.0, step=10.0, key="min_vph")
-    wait_minutes = st.number_input("API키 쿼터 소진 시 대기시간(분)", min_value=0.0, value=0.0, step=0.5, key="wait_minutes")
-    ignore_filters = st.checkbox("테스트용: 길이/시간당 조회수 필터 무시", value=False, key="ignore_filters")
+    st.selectbox("실행모드", ["채널", "키워드", "둘다"], index=2, key="run_mode")
+    st.selectbox("쇼츠/롱폼", ["쇼츠", "롱폼", "둘다"], key="form_factor")
+    st.number_input("쇼츠 기준(초)", min_value=10, max_value=300, value=60, step=5, key="shorts_sec")
+    st.number_input("최근 몇일간의 영상을 분석할까요", min_value=1, max_value=3650, value=180, key="days_back")
+    st.number_input("채널당 최대 검색 수", min_value=10, max_value=1000, value=200, step=10, key="per_channel_max")
+    st.number_input("검색어당 최대 검색수", min_value=10, max_value=1000, value=200, step=10, key="per_keyword_max")
+    st.number_input("최소 시간당 조회수", min_value=0.0, value=0.0, step=10.0, key="min_vph")
+    st.number_input("API키 쿼터 소진 시 대기시간(분)", min_value=0.0, value=0.0, step=0.5, key="wait_minutes")
+    st.checkbox("테스트용: 길이/시간당 조회수 필터 무시", value=False, key="ignore_filters")
 
     # 국가 범위만 선택(심플)
     st.markdown("### 🌐 국가 범위")
@@ -639,27 +684,27 @@ if user_key:
     overseas_regions = []
     if scope in ("해외만", "한국+해외"):
         overseas_regions = st.multiselect("해외 국가 선택", options=FOREIGN_PRESET, default=FOREIGN_PRESET, key="overseas_regions")
-    target_regions = (["KR"] if scope in ("한국만","한국+해외") else []) + (overseas_regions if scope in ("해외만","한국+해외") else [])
+    target_regions = (["KR"] if scope in ("한국만", "한국+해외") else []) + (overseas_regions if scope in ("해외만", "한국+해외") else [])
     st.session_state["target_regions"] = target_regions
 
     # 키워드 엄격 필터 옵션
     st.markdown("**키워드 정확도 옵션**")
-    strict_on = st.checkbox("키워드 엄격 필터링 (제목/설명/태그 검사)", value=True, key="kw_strict_on")
-    strict_mode = st.radio("매칭 방식", options=["하나 이상 포함(권장)", "모두 포함(엄격)"], index=0, horizontal=True, key="kw_strict_mode")
+    st.checkbox("키워드 엄격 필터링 (제목/설명/태그 검사)", value=True, key="kw_strict_on")
+    st.radio("매칭 방식", options=["하나 이상 포함(권장)", "모두 포함(엄격)"], index=0, horizontal=True, key="kw_strict_mode")
 
     # Quota Estimator (대략)
     st.subheader("🔢 쿼터 예상 소모량")
-    def parse_for_estimator(txt: Optional[str]) -> List[str]:
+    def _parse_for_estimator(txt: Optional[str]) -> List[str]:
         return [p.strip() for part in (txt or "").split(",") for p in part.split() if p.strip()]
-    ch_list = parse_for_estimator(st.session_state.get("channels_input","")) if st.session_state["run_mode"] in ("채널","둘다") else []
-    kw_list = st.session_state.get("effective_keywords", []) if st.session_state["run_mode"] in ("키워드","둘다") else []
+    ch_list = _parse_for_estimator(st.session_state.get("channels_input", "")) if st.session_state["run_mode"] in ("채널", "둘다") else []
+    kw_list = st.session_state.get("effective_keywords", []) if st.session_state["run_mode"] in ("키워드", "둘다") else []
     est_videos = len(ch_list) * st.session_state["per_channel_max"] + len(kw_list) * st.session_state["per_keyword_max"]
-    search_calls = len(ch_list) * math.ceil(st.session_state["per_channel_max"]/50) + len(kw_list) * math.ceil(st.session_state["per_keyword_max"]/50)
+    search_calls = len(ch_list) * math.ceil(st.session_state["per_channel_max"] / 50) + len(kw_list) * math.ceil(st.session_state["per_keyword_max"] / 50)
     search_units = search_calls * 100
-    videos_calls = math.ceil(est_videos/50) if est_videos else 0
+    videos_calls = math.ceil(est_videos / 50) if est_videos else 0
     videos_units = videos_calls * 1
-    chan_calls_min = math.ceil((len(ch_list) or 0)/50) if est_videos else 0
-    chan_calls_max = math.ceil(est_videos/50) if est_videos else 0
+    chan_calls_min = math.ceil((len(ch_list) or 0) / 50) if est_videos else 0
+    chan_calls_max = math.ceil(est_videos / 50) if est_videos else 0
     chan_units_min = chan_calls_min * 1
     chan_units_max = chan_calls_max * 1
     total_units_min = search_units + videos_units + chan_units_min
@@ -673,8 +718,10 @@ if user_key:
     cC.metric("channels.list(1/u)", f"{chan_units_min:,} ~ {chan_units_max:,}", f"{chan_calls_min}~{chan_calls_max} calls")
     cD.metric("총 예상(최소~최대)", f"{total_units_min:,} ~ {total_units_max:,}", f"일일 한도 {quota:,}")
 
-    if not warn: st.success("대부분 한도 내에서 동작합니다.")
-    else: st.error("최대 추정 사용량이 일일 한도를 초과할 수 있습니다. 검색 개수/키워드/채널 수를 조정하세요.")
+    if not warn:
+        st.success("대부분 한도 내에서 동작합니다.")
+    else:
+        st.error("최대 추정 사용량이 일일 한도를 초과할 수 있습니다. 검색 개수/키워드/채널 수를 조정하세요.")
 
     col_run, col_clear = st.columns([0.25, 0.25])
     run = col_run.button("시작하기", type="primary", key="run_btn")
@@ -684,9 +731,7 @@ if user_key:
         st.session_state["payload_cache"] = []
         st.experimental_rerun()
 
-# -----------------------
-# Main run
-# -----------------------
+# ----------------------- Main run -----------------------
 if 'run' in locals() and run:
     api_key = st.session_state.get("api_key", "")
     if not api_key:
@@ -708,15 +753,15 @@ if 'run' in locals() and run:
     strict_mode_val = st.session_state["kw_strict_mode"]
     strict_mode_key = "all" if strict_mode_val == "모두 포함(엄격)" else "any"
 
-    # 입력 탭에서 결정된 최종 키워드/언어
     base_keywords = st.session_state.get("effective_keywords", [])
     effective_lang = st.session_state.get("effective_lang", "ko")
 
-    def parse_list_field_inner(txt: Optional[str]) -> List[str]:
-        if not txt: return []
+    def _parse_inner(txt: Optional[str]) -> List[str]:
+        if not txt:
+            return []
         return [p.strip() for part in txt.split(",") for p in part.split() if p.strip()]
 
-    input_channels = parse_list_field_inner(st.session_state.get("channels_input","")) if run_mode in ("채널","둘다") else []
+    input_channels = _parse_inner(st.session_state.get("channels_input", "")) if run_mode in ("채널", "둘다") else []
 
     if len(input_channels) == 0 and len(base_keywords) == 0:
         st.error("실행모드에 맞게 채널 또는 키워드를 최소 1개 이상 입력하세요.")
@@ -729,21 +774,22 @@ if 'run' in locals() and run:
             out: List[str] = []
             for token in lst:
                 if token.startswith("@"):
-                    data = yt_get("search", {"part":"snippet", "type":"channel", "q": token, "maxResults": 1}, api_key, wait_minutes=wait_minutes)
+                    data = yt_get("search", {"part": "snippet", "type": "channel", "q": token, "maxResults": 1}, api_key, wait_minutes=wait_minutes)
                     items = data.get("items", [])
                     ch_id = items[0]["snippet"].get("channelId") if items else None
-                    if not ch_id and items: ch_id = items[0]["id"].get("channelId")
-                    if ch_id: out.append(ch_id)
+                    if not ch_id and items:
+                        ch_id = items[0]["id"].get("channelId")
+                    if ch_id:
+                        out.append(ch_id)
                 else:
                     out.append(token)
             return out
 
-        channels = resolve_channel_ids(input_channels) if run_mode in ("채널","둘다") else []
-
+        channels = resolve_channel_ids(input_channels) if run_mode in ("채널", "둘다") else []
         collected_ids = set()
 
         # 채널 모드
-        if run_mode in ("채널","둘다"):
+        if run_mode in ("채널", "둘다"):
             for region in target_regions:
                 for ch in channels:
                     ids = fetch_videos_by_search(
@@ -755,10 +801,11 @@ if 'run' in locals() and run:
                     collected_ids.update(ids); time.sleep(0.02)
 
         # 키워드 모드
-        if run_mode in ("키워드","둘다"):
+        if run_mode in ("키워드", "둘다"):
             for region in target_regions:
                 for kw in base_keywords:
-                    if not kw: continue
+                    if not kw:
+                        continue
                     ids = fetch_videos_by_search(
                         api_key, query=kw,
                         region_code=region, relevance_language=effective_lang,
@@ -775,7 +822,7 @@ if 'run' in locals() and run:
         channel_ids = {v["snippet"]["channelId"] for v in details.values() if "snippet" in v}
         subs_map = fetch_channel_subs(api_key, list(channel_ids), wait_minutes=wait_minutes) if channel_ids else {}
 
-        # 엄격 필터용 키워드(현재 사용 중인 언어의 키워드만)
+        # 엄격 필터용 키워드
         all_keywords_norm = [normalize_text(k) for k in base_keywords]
 
         rows: List[Dict[str, Any]] = []
@@ -796,12 +843,13 @@ if 'run' in locals() and run:
                 tags = detail.get("snippet", {}).get("tags", [])
                 tag_text = " ".join(tags) if isinstance(tags, list) else ""
                 combined = f"{title}\n{desc}\n{tag_text}"
-                if not contains_keywords(combined, all_keywords_norm, mode=strict_mode_key):
+                mode_key = "all" if strict_mode_key == "all" else "any"
+                if not contains_keywords(combined, all_keywords_norm, mode=mode_key):
                     continue
 
             ch_id = snip["channelId"]
             subs = int(subs_map.get(ch_id, 0))
-            vs = (metrics["views"]/subs) if subs > 0 else None
+            vs = (metrics["views"] / subs) if subs > 0 else None
             thumb = (snip.get("thumbnails", {}).get("medium")
                      or snip.get("thumbnails", {}).get("high")
                      or snip.get("thumbnails", {}).get("default")
@@ -823,15 +871,13 @@ if 'run' in locals() and run:
             })
 
         results_df = pd.DataFrame(rows, columns=[
-            "Channel","Video Title","Uploaded","_Uploaded_ts","Views","Views/hr",
-            "Subscribers","Views/Subscribers","Duration","_Duration_sec","URL","_vid","_thumb"
+            "Channel", "Video Title", "Uploaded", "_Uploaded_ts", "Views", "Views/hr",
+            "Subscribers", "Views/Subscribers", "Duration", "_Duration_sec", "URL", "_vid", "_thumb"
         ])
         st.session_state["results_df"] = results_df
         st.session_state["payload_cache"] = []  # 새 검색 시 캐시 무효화
 
-# -----------------------
-# Results tab
-# -----------------------
+# ----------------------- Results tab -----------------------
 with tab_results:
     st.subheader("결과")
     df = st.session_state.get("results_df", pd.DataFrame())
@@ -839,7 +885,7 @@ with tab_results:
         st.info("아직 결과가 없습니다. 설정 탭에서 ‘시작하기’를 눌러 검색해 주세요.")
     else:
         st.success(f"{len(df)}개 결과")
-        df_sorted = df.sort_values(by=["Views/hr","Views"], ascending=[False, False], kind="mergesort")
+        df_sorted = df.sort_values(by=["Views/hr", "Views"], ascending=[False, False], kind="mergesort")
 
         if st.session_state["payload_cache"]:
             payload = st.session_state["payload_cache"]
@@ -868,7 +914,7 @@ with tab_results:
             except Exception:
                 bio = BytesIO(); bio.write(b"Install openpyxl: pip install openpyxl"); return bio.getvalue()
             out = BytesIO()
-            export_df = dfi.drop(columns=["_Uploaded_ts","_Duration_sec","_vid","_thumb"], errors="ignore")
+            export_df = dfi.drop(columns=["_Uploaded_ts", "_Duration_sec", "_vid", "_thumb"], errors="ignore")
             with pd.ExcelWriter(out, engine="openpyxl") as writer:
                 export_df.to_excel(writer, index=False, sheet_name="HotVideos")
             return out.getvalue()
@@ -894,7 +940,7 @@ with tab_results:
             }
             st.session_state.setdefault("transcript_selection", list(titles_map.keys())[:50])
             select_keys = st.multiselect("대본을 받을 영상 선택", options=list(titles_map.keys()), key="transcript_selection")
-            lang_pref = st.text_input("우선 언어(예: ko, en, ko-KR)", value=st.session_state.get("lang_pref","ko"), key="lang_pref")
+            lang_pref = st.text_input("우선 언어(예: ko, en, ko-KR)", value=st.session_state.get("lang_pref", "ko"), key="lang_pref")
 
             col_srt, col_zip = st.columns([0.5, 0.5])
             with col_srt:
@@ -924,6 +970,4 @@ with tab_results:
                     st.caption("선택된 항목이 없습니다.")
 
 st.markdown("---")
-st.caption("입력 탭에서 바로 다국어 키워드를 미리보고, 설정 탭에서는 국가 범위만 고르면 됩니다. 제목·설명·태그 기반 엄격 필터도 유지됩니다.")
-
-
+st.caption("입력 탭에서 다국어 키워드를 미리보고, 설정 탭에서는 국가 범위만 고르면 됩니다. 제목·설명·태그 기반 엄격 필터도 유지됩니다.")
