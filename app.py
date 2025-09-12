@@ -17,6 +17,20 @@ from typing import Optional, List, Dict, Any, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
+# === Secrets → session_state (최우선) ===
+if "api_keys" not in st.session_state:
+    # 배열형(권장)
+    keys = list(st.secrets.get("YOUTUBE_API_KEYS", []))
+    # 단일 키 호환
+    if not keys and "YOUTUBE_API_KEY" in st.secrets:
+        keys = [st.secrets["YOUTUBE_API_KEY"]]
+
+    st.session_state["api_keys"] = keys
+    st.session_state["api_key_idx"] = 0
+    if keys:
+        st.session_state["api_key"] = keys[0]  # 기존 코드와의 호환
+
+
 # -----------------------
 # Constants / Config
 # -----------------------
@@ -858,3 +872,4 @@ with tab_results:
 
 st.markdown("---")
 st.caption("입력 탭에서 바로 다국어 키워드를 미리보고, 설정 탭에서는 국가 범위만 고르면 됩니다. 제목·설명·태그 기반 엄격 필터도 유지됩니다.")
+
