@@ -1,9 +1,9 @@
-streamlit==1.36.0
-requests==2.32.3
-pandas==2.2.2
-youtube-transcript-api==0.6.2
-openpyxl==3.1.2
-
-# 번역기 (deep-translator 우선, googletrans는 백업용)
+streamlit==1.35.0
+requests>=2.31.0
+pandas>=2.0
+youtube-transcript-api>=0.6.1
+openpyxl>=3.1.2
 deep-translator==1.11.4
-googletrans==4.0.0-rc1
+googletrans==4.0.0rc1
+
+
