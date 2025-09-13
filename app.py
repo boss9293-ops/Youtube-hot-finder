@@ -2,6 +2,7 @@
 # - 입력 탭: 원문 키워드 → 실시간 번역(예: ko→ja), "번역을 검색에 사용" 체크 시 번역본으로 검색
 # - 설정 탭: 국가 범위(한국만/해외만/한국+해외)만 선택 — 중복되는 언어/국가 입력 제거
 # - 결과 테이블: 헤더 정렬 + hover 미리보기 (JS, rerun 없음)
+# - 제목 한국어 번역: 제목 아래 한 줄/툴팁 옵션 추가 (캐시)
 # - 키워드 엄격 필터(제목/설명/태그), Excel, Transcript(SRT/ZIP), 쿼터 추적
 # - Windows 친화, pyarrow 미사용
 
@@ -180,6 +181,23 @@ def translate_keywords_list(keywords: List[str], src_lang: str, tgt_lang: str) -
         if v and v.lower() not in seen:
             seen.add(v.lower()); outs.append(v)
     return outs
+
+# ▼ 제목 한국어 번역(캐시) — googletrans → deep-translator 순서로 시도, 실패 시 원문 반환
+@st.cache_data(show_spinner=False)
+def translate_to_ko_once(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return s
+    try:
+        from googletrans import Translator
+        return Translator().translate(s, dest="ko").text
+    except Exception:
+        pass
+    try:
+        from deep_translator import GoogleTranslator as DTGoogle
+        return DTGoogle(source="auto", target="ko").translate(s)
+    except Exception:
+        return s
 
 # -----------------------------------------------------------------------------
 # YouTube API helpers (쿼터 초과 시 자동 로테이션)
@@ -363,9 +381,9 @@ def contains_keywords(text: str, keywords: List[str], mode: str) -> bool:
         return any(k in t for k in ks)
 
 # -----------------------------------------------------------------------------
-# HTML/JS component (table + preview)
+# HTML/JS component (table + preview) — 한국어 번역 표시/툴팁 옵션 통합
 # -----------------------------------------------------------------------------
-def build_component_html(payload: List[Dict[str, Any]]) -> str:
+def build_component_html(payload: List[Dict[str, Any]], show_ko: bool = True, tooltip_ko: bool = True) -> str:
     tpl = r"""
 <div id="app-root"></div>
 <script type="application/json" id="data">__DATA__</script>
@@ -386,6 +404,7 @@ colgroup col.title{width:24%;} colgroup col.channel{width:14%;} colgroup col.upl
 colgroup col.views{width:10%;} colgroup col.vph{width:10%;} colgroup col.subs{width:10%;}
 colgroup col.vs{width:9%;} colgroup col.dur{width:10%;}
 td.title,th.title{white-space:normal;word-break:break-word;line-height:1.25;font-size:11.5px;}
+td.title .title-ko{display:block;color:var(--muted);font-size:11px;margin-top:2px;} /* 번역 줄 */
 td:not(.title),th:not(.title){white-space:nowrap;}
 .preview{border:1px solid var(--border);border-radius:10px;padding:8px;}
 .preview .img-wrap{display:flex;justify-content:center;}
@@ -399,6 +418,11 @@ td:not(.title),th:not(.title){white-space:nowrap;}
 (function(){
   const root = document.getElementById('app-root');
   const data = JSON.parse(document.getElementById('data').textContent || "[]");
+
+  // ▼ 파이썬에서 내려준 옵션
+  const SHOW_KO = __SHOW_KO__;
+  const TOOLTIP_KO = __TOOLTIP_KO__;
+
   const columns = [
     {key:'title',label:'Video Title',type:'str',className:'title'},
     {key:'channel',label:'Channel',type:'str',className:'channel'},
@@ -459,9 +483,17 @@ td:not(.title),th:not(.title){white-space:nowrap;}
   container.appendChild(tableWrap); container.appendChild(preview); root.appendChild(container);
 
   function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
   function rowHTML(r){
+    // 제목 본문 + 번역 줄 구성
+    let titleInner = escapeHtml(r.title);
+    if (SHOW_KO && r.title_ko && r.title_ko !== r.title){
+      titleInner += '<span class="title-ko">'+escapeHtml(r.title_ko)+'</span>';
+    }
+    const titleAttr = TOOLTIP_KO && r.title_ko ? r.title_ko : r.title;
+
     return '<tr data-vid="'+r.vid+'">'
-      + '<td class="title" title="'+escapeHtml(r.title)+'">'+escapeHtml(r.title)+'</td>'
+      + '<td class="title" title="'+escapeHtml(titleAttr)+'">'+titleInner+'</td>'
       + '<td class="channel" title="'+escapeHtml(r.channel)+'">'+escapeHtml(r.channel)+'</td>'
       + '<td class="uploaded" data-sort="'+r.uploaded_ts+'">'+escapeHtml(r.uploaded)+'</td>'
       + '<td class="views" data-sort="'+r.views+'">'+fmtInt(r.views)+'</td>'
@@ -471,6 +503,7 @@ td:not(.title),th:not(.title){white-space:nowrap;}
       + '<td class="dur" data-sort="'+r.duration_sec+'">'+escapeHtml(r.duration)+'</td>'
       + '</tr>';
   }
+
   function renderBody(){
     tbody.innerHTML = rows.map(rowHTML).join('');
     Array.prototype.forEach.call(tbody.querySelectorAll('tr'), function(tr){
@@ -487,6 +520,7 @@ td:not(.title),th:not(.title){white-space:nowrap;}
     });
   }
   renderBody();
+
   if(rows.length){
     const r=rows[0]; pvImg.src=r.thumb; pvTitle.textContent=r.title; pvMeta.textContent=r.channel+' · '+r.uploaded;
     pvBadges.innerHTML = '<span class="badge">Views: '+fmtInt(r.views)+'</span>'
@@ -500,7 +534,10 @@ td:not(.title),th:not(.title){white-space:nowrap;}
 </script>
 """
     data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    return tpl.replace("__DATA__", data_json)
+    return (tpl
+            .replace("__DATA__", data_json)
+            .replace("__SHOW_KO__", "true" if show_ko else "false")
+            .replace("__TOOLTIP_KO__", "true" if tooltip_ko else "false"))
 
 # -----------------------------------------------------------------------------
 # Transcript helpers
@@ -880,6 +917,11 @@ if 'run' in locals() and run:
 # ----------------------- Results tab -----------------------
 with tab_results:
     st.subheader("결과")
+
+    # ▼ 새 옵션: 제목 한국어 번역 표시/툴팁
+    show_title_ko = st.checkbox("제목 아래 한국어 번역 표시", value=True, key="show_title_ko")
+    tooltip_title_ko = st.checkbox("제목에 마우스 오버 시 한국어 툴팁", value=True, key="tooltip_title_ko")
+
     df = st.session_state.get("results_df", pd.DataFrame())
     if df.empty:
         st.info("아직 결과가 없습니다. 설정 탭에서 ‘시작하기’를 눌러 검색해 주세요.")
@@ -892,8 +934,10 @@ with tab_results:
         else:
             payload: List[Dict[str, Any]] = []
             for _, r in df_sorted.iterrows():
+                # 필요할 때만 번역(캐시됨)
+                title_ko = translate_to_ko_once(r["Video Title"]) if (show_title_ko or tooltip_title_ko) else ""
                 payload.append({
-                    "channel": r["Channel"], "title": r["Video Title"],
+                    "channel": r["Channel"], "title": r["Video Title"], "title_ko": title_ko,
                     "uploaded": r["Uploaded"], "uploaded_ts": float(r["_Uploaded_ts"]),
                     "views": int(r["Views"]), "vph": float(r["Views/hr"]),
                     "subs": int(r["Subscribers"]),
@@ -903,7 +947,8 @@ with tab_results:
                 })
             st.session_state["payload_cache"] = payload
 
-        html = build_component_html(st.session_state["payload_cache"])
+        html = build_component_html(st.session_state["payload_cache"],
+                                    show_ko=show_title_ko, tooltip_ko=tooltip_title_ko)
         components.html(html, height=680, scrolling=False)
 
         @st.cache_data
